@@ -171,6 +171,38 @@ struct inet_sock {
 	__be32			mc_addr;
 	struct ip_mc_socklist __rcu	*mc_list;
 	struct inet_cork_full	cork;
+#ifdef CONFIG_VIRTIO_SOCKET
+	u64			accept_level;
+	bool			accept_level_is_high;
+	bool			writes_plugged;
+	bool			host_waiting_for_rx_tail;
+	/* List of outstanding accepts being processed in the device. */
+	struct list_head	pending_accepts;
+	int			last_error;
+	/*
+	 * The following are used to schedule work to be attempted again
+	 * later in process context.  Scheduling happens with bh-lock.
+	 */
+	struct delayed_work	cmd_work;
+#define VIRTIO_SOCKET_SCHEDULED_RX_UNDERRUN	0x00
+	atomic_long_t		cmd_bitmap;
+#define VIRTIO_SOCKET_REFERENCED_IN_CONNECT	0x01
+#define VIRTIO_SOCKET_REFERENCED_IN_BIND	0x02
+#define VIRTIO_SOCKET_REFERENCED_IN_ACCEPT	0x03
+	__u8			first_referenced_from;
+	int			(*saved_sk_backlog_rcv)(struct sock *sk,
+							struct sk_buff *skb);
+	/*
+	 * The following is passed to the device and represents an area that
+	 * the device will asynchronously DMA from to get at our socket's
+	 * details.  The format here is specified by the virtio socket
+	 * specification.
+	 */
+	struct guest_control_block {
+		u32	rx_tail;
+		u32	rx_buffer_depth;
+	} ____cacheline_aligned gcb;
+#endif
 };
 
 #define IPCORK_OPT	1	/* ip-options has been held in ipcork.opt */

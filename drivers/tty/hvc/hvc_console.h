@@ -58,6 +58,7 @@ struct hvc_struct {
 	const struct hv_ops *ops;
 	int irq_requested;
 	int data;
+	struct console *hvc_console;
 	struct winsize ws;
 	struct work_struct tty_resize;
 	struct list_head next;

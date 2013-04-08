@@ -37,6 +37,7 @@ module_param(gso, bool, 0444);
 /* FIXME: MTU in config. */
 #define MAX_PACKET_LEN (ETH_HLEN + VLAN_HLEN + ETH_DATA_LEN)
 #define GOOD_COPY_LEN	128
+#define MAX_RX_ALLOCATE_BATCH	32
 
 #define VIRTNET_SEND_COMMAND_SG_MAX    2
 #define VIRTNET_DRIVER_VERSION "1.0.0"
@@ -115,6 +116,20 @@ static void give_pages(struct virtnet_info *vi, struct page *page)
 	for (end = page; end->private; end = (struct page *)end->private);
 	end->private = (unsigned long)vi->pages;
 	vi->pages = page;
+}
+
+/*
+ * Give a list of pages threaded through the ->private field back to the page
+ * allocator.  To be used by paths that aren't serialized with napi.
+ */
+static void __give_pages(struct page *page)
+{
+	struct page *nextpage;
+	do {
+		nextpage = (struct page *)page->private;
+		__free_page(page);
+		page = nextpage;
+	} while (page);
 }
 
 static struct page *get_a_page(struct virtnet_info *vi, gfp_t gfp_mask)
@@ -353,17 +368,35 @@ frame_err:
 	dev_kfree_skb(skb);
 }
 
-static int add_recvbuf_small(struct virtnet_info *vi, gfp_t gfp)
+/*
+ * Allocate an skb for "small" receive buffer configurations.
+ * May return NULL if oom.
+ * No serialization required.
+ */
+static struct sk_buff *alloc_recvbuf_small(struct virtnet_info *vi, gfp_t gfp)
 {
 	struct sk_buff *skb;
-	struct skb_vnet_hdr *hdr;
-	int err;
 
 	skb = __netdev_alloc_skb_ip_align(vi->dev, MAX_PACKET_LEN, gfp);
 	if (unlikely(!skb))
-		return -ENOMEM;
+		return NULL;
 
 	skb_put(skb, MAX_PACKET_LEN);
+	return skb;
+}
+
+/*
+ * Add a skb to the receive queue for "small" receive buffer configurations.
+ * Returns the number of virtqueue slots left free on success, negative errno
+ * otherwise.
+ * Always consumes skb.
+ * Must be serialized with the napi poll path.
+ */
+static int add_recvbuf_small(struct virtnet_info *vi, struct sk_buff *skb,
+			     gfp_t gfp)
+{
+	struct skb_vnet_hdr *hdr;
+	int err;
 
 	hdr = skb_vnet_hdr(skb);
 	sg_set_buf(vi->rx_sg, &hdr->hdr, sizeof hdr->hdr);
@@ -373,36 +406,59 @@ static int add_recvbuf_small(struct virtnet_info *vi, gfp_t gfp)
 	err = virtqueue_add_buf(vi->rvq, vi->rx_sg, 0, 2, skb, gfp);
 	if (err < 0)
 		dev_kfree_skb(skb);
+	else
+		vi->num++;
 
 	return err;
 }
 
-static int add_recvbuf_big(struct virtnet_info *vi, gfp_t gfp)
+/*
+ * Allocate an list of pages for "big" receive buffer configurations.
+ * Pages are chained through ->private.
+ * May return null if oom.
+ * napi_serialized must be false if we aren't serialized with the napi path.
+ */
+static struct page *alloc_recvbuf_big(struct virtnet_info *vi,
+				      bool napi_serialized, gfp_t gfp)
 {
-	struct page *first, *list = NULL;
+	struct page *first, *tail = NULL;
+	int i;
+
+	/* Build a list of pages chained through ->private.  Built in reverse order */
+	for (i = 0; i < MAX_SKB_FRAGS + 1; ++i) {
+		first = napi_serialized ? get_a_page(vi, gfp) : alloc_page(gfp);
+		if (!first) {
+			if (tail) {
+				if (napi_serialized)
+					give_pages(vi, tail);
+				else
+					__give_pages(tail);
+			}
+			return NULL;
+		}
+
+		/* chain new page in list head  */
+		first->private = (unsigned long)tail;
+		tail = first;
+	}
+	return first;
+}
+
+/*
+ * Add a chain of pages to the receive queue for "big" receive buffer
+ * configurations.
+ * Returns the number of virtqueue slots left free on success, negative errno
+ * otherwise.
+ * Always consumes the entire chain of pages.
+ * Must be serialized with the napi poll path.
+ */
+static int add_recvbuf_big(struct virtnet_info *vi, struct page *first,
+			   gfp_t gfp)
+{
+	struct page *page;
 	char *p;
 	int i, err, offset;
 
-	/* page in vi->rx_sg[MAX_SKB_FRAGS + 1] is list tail */
-	for (i = MAX_SKB_FRAGS + 1; i > 1; --i) {
-		first = get_a_page(vi, gfp);
-		if (!first) {
-			if (list)
-				give_pages(vi, list);
-			return -ENOMEM;
-		}
-		sg_set_buf(&vi->rx_sg[i], page_address(first), PAGE_SIZE);
-
-		/* chain new page in list head to match sg */
-		first->private = (unsigned long)list;
-		list = first;
-	}
-
-	first = get_a_page(vi, gfp);
-	if (!first) {
-		give_pages(vi, list);
-		return -ENOMEM;
-	}
 	p = page_address(first);
 
 	/* vi->rx_sg[0], vi->rx_sg[1] share the same page */
@@ -413,30 +469,61 @@ static int add_recvbuf_big(struct virtnet_info *vi, gfp_t gfp)
 	offset = sizeof(struct padded_vnet_hdr);
 	sg_set_buf(&vi->rx_sg[1], p + offset, PAGE_SIZE - offset);
 
-	/* chain first in list head */
-	first->private = (unsigned long)list;
+	/* Chain in the rest of the pages */
+	i = 2;  /* Offset to insert further pages into the sg */
+	page = (struct page *)first->private;
+	while (page) {
+		sg_set_buf(&vi->rx_sg[i], page_address(page), PAGE_SIZE);
+		page = (struct page *)page->private;
+		i++;
+	}
 	err = virtqueue_add_buf(vi->rvq, vi->rx_sg, 0, MAX_SKB_FRAGS + 2,
 				first, gfp);
 	if (err < 0)
 		give_pages(vi, first);
+	else
+		vi->num++;
 
 	return err;
 }
 
-static int add_recvbuf_mergeable(struct virtnet_info *vi, gfp_t gfp)
+/*
+ * Allocate a page for "mergeable" receive buffer configurations.
+ * May return NULL if oom.
+ * @napi_serialized must be false if we aren't serialized with the napi path.
+ */
+static struct page *alloc_recvbuf_mergeable(struct virtnet_info *vi,
+					    bool napi_serialized, gfp_t gfp)
 {
 	struct page *page;
-	int err;
+	if (napi_serialized)
+		return get_a_page(vi, gfp);
+	page = alloc_page(gfp);
+	if (page)
+		page->private = 0;
+	return page;
+}
 
-	page = get_a_page(vi, gfp);
-	if (!page)
-		return -ENOMEM;
+/*
+ * Add a page to the receive queue for "mergeable" receive buffer
+ * configurations.
+ * Returns the number of virtqueue slots left free on success, negative errno
+ * otherwise.
+ * Always consumes the page.
+ * Must be serialized with the napi poll path.
+ */
+static int add_recvbuf_mergeable(struct virtnet_info *vi, struct page *page,
+				 gfp_t gfp)
+{
+	int err;
 
 	sg_init_one(vi->rx_sg, page_address(page), PAGE_SIZE);
 
 	err = virtqueue_add_buf(vi->rvq, vi->rx_sg, 0, 1, page, gfp);
 	if (err < 0)
 		give_pages(vi, page);
+	else
+		vi->num++;
 
 	return err;
 }
@@ -454,17 +541,32 @@ static bool try_fill_recv(struct virtnet_info *vi, gfp_t gfp)
 	bool oom;
 
 	do {
-		if (vi->mergeable_rx_bufs)
-			err = add_recvbuf_mergeable(vi, gfp);
-		else if (vi->big_packets)
-			err = add_recvbuf_big(vi, gfp);
-		else
-			err = add_recvbuf_small(vi, gfp);
+		if (vi->mergeable_rx_bufs) {
+			struct page *page;
+			page = alloc_recvbuf_mergeable(vi, true, gfp);
+			if (!page)
+				err = -ENOMEM;
+			else
+				err = add_recvbuf_mergeable(vi, page, gfp);
+		} else if (vi->big_packets) {
+			struct page *page;
+			page = alloc_recvbuf_big(vi, true, gfp);
+			if (!page)
+				err = -ENOMEM;
+			else
+				err = add_recvbuf_big(vi, page, gfp);
+		} else {
+			struct sk_buff *skb;
+			skb = alloc_recvbuf_small(vi, gfp);
+			if (!skb)
+				err = -ENOMEM;
+			else
+				err = add_recvbuf_small(vi, skb, gfp);
+		}
 
 		oom = err == -ENOMEM;
 		if (err < 0)
 			break;
-		++vi->num;
 	} while (err > 0);
 	if (unlikely(vi->num > vi->max))
 		vi->max = vi->num;
@@ -496,15 +598,157 @@ static void virtnet_napi_enable(struct virtnet_info *vi)
 	}
 }
 
+/*
+ * Try to fill a "big" or "mergeable" receive queue using batching.
+ * This call will serialize itself against NAPI.
+ * Returns false if we failed to finish due to oom.
+ */
+static bool fill_recvbatch_pages(struct virtnet_info *vi)
+{
+	bool oom = false;
+	bool full = false;
+	LIST_HEAD(local_list);
+	struct page *page, *npage;
+	int i;
+
+	BUG_ON(!vi->big_packets && !vi->mergeable_rx_bufs);
+fill_more:
+	/* Allocate a batch. */
+	for (i = 0; i < MAX_RX_ALLOCATE_BATCH; i++) {
+		if (vi->mergeable_rx_bufs)
+			page = alloc_recvbuf_mergeable(vi, false, GFP_KERNEL);
+		else  /* vi->big_packets */
+			page = alloc_recvbuf_big(vi, false, GFP_KERNEL);
+		if (!page) {
+			oom =  true;
+			break;
+		}
+		list_add_tail(&page->lru, &local_list);
+	}
+
+	/* Enqueue batch as available. */
+	napi_disable(&vi->napi);
+	list_for_each_entry_safe(page, npage, &local_list, lru) {
+		int err;
+
+		list_del(&page->lru);
+		if (vi->mergeable_rx_bufs)
+			err = add_recvbuf_mergeable(vi, page, GFP_KERNEL);
+		else  /* vi->big_packets */
+			err = add_recvbuf_big(vi, page, GFP_KERNEL);
+		if (err > 0)
+			continue;
+		if (err == -ENOSPC || err == 0)
+			full = true;
+		else if (err == -ENOMEM)
+			oom = true;
+		else
+			BUG();
+		break;
+	}
+	if (unlikely(vi->num > vi->max))
+		vi->max = vi->num;
+	virtqueue_kick(vi->rvq);
+	virtnet_napi_enable(vi);
+
+	/* Cleanup any remaining entries on the list */
+	if (unlikely(!list_empty(&local_list))) {
+		list_for_each_entry_safe(page, npage, &local_list, lru) {
+			list_del(&page->lru);
+			__give_pages(page);
+		}
+	}
+
+	if (!oom && !full)
+		goto fill_more;
+
+	return !oom;
+}
+
+/*
+ * Try to fill a "small" receive queue using batching.
+ * This call will serialize itself against NAPI.
+ * Returns false if we failed to finish due to oom.
+ */
+static bool fill_recvbatch_small(struct virtnet_info *vi)
+{
+	bool oom = false;
+	bool full = false;
+	LIST_HEAD(local_list);
+	struct list_head *pos, *npos;
+	struct sk_buff *skb;
+	int i;
+
+fill_more:
+	/* Allocate a batch. */
+	for (i = 0; i < MAX_RX_ALLOCATE_BATCH; i++) {
+		skb = alloc_recvbuf_small(vi, GFP_KERNEL);
+		if (!skb) {
+			oom =  true;
+			break;
+		}
+		list_add_tail((struct list_head *)skb, &local_list);
+	}
+
+	/* Enqueue batch as available. */
+	napi_disable(&vi->napi);
+	list_for_each_safe(pos, npos, &local_list) {
+		int err;
+
+		list_del(pos);
+		skb = (struct sk_buff *)pos;
+
+		err = add_recvbuf_small(vi, skb, GFP_KERNEL);
+		if (err > 0)
+			continue;
+		if (err == -ENOSPC || err == 0)
+			full = true;
+		else if (err == -ENOMEM)
+			oom = true;
+		else
+			BUG();
+		break;
+	}
+	if (unlikely(vi->num > vi->max))
+		vi->max = vi->num;
+	virtqueue_kick(vi->rvq);
+	virtnet_napi_enable(vi);
+
+	/* Cleanup any remaining entries on the list */
+	if (unlikely(!list_empty(&local_list))) {
+		list_for_each_safe(pos, npos, &local_list) {
+			skb = (struct sk_buff *)pos;
+			list_del(pos);
+			dev_kfree_skb(skb);
+		}
+	}
+
+	if (!oom && !full)
+		goto fill_more;
+
+	return !oom;
+}
+
+/*
+ * Refill the receive queues from process context.
+ * Callee will serialize against NAPI itself.
+ * Returns false if we failed to allocate due to memory pressure.
+ */
+static bool try_fill_recvbatch(struct virtnet_info *vi)
+{
+	if (vi->mergeable_rx_bufs || vi->big_packets)
+		return fill_recvbatch_pages(vi);
+	else
+		return fill_recvbatch_small(vi);
+}
+
 static void refill_work(struct work_struct *work)
 {
 	struct virtnet_info *vi;
 	bool still_empty;
 
 	vi = container_of(work, struct virtnet_info, refill.work);
-	napi_disable(&vi->napi);
-	still_empty = !try_fill_recv(vi, GFP_KERNEL);
-	virtnet_napi_enable(vi);
+	still_empty = !try_fill_recvbatch(vi);
 
 	/* In theory, this can happen: if we don't get any buffers in
 	 * we will *never* try to fill again. */

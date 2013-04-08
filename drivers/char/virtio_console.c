@@ -969,6 +969,7 @@ int __init virtio_cons_early_init(int (*put_chars)(u32, const char *, int))
 int init_port_console(struct port *port)
 {
 	int ret;
+	int saved_vtermno;
 
 	/*
 	 * The Host's telling us this port is a console port.  Hook it
@@ -987,18 +988,27 @@ int init_port_console(struct port *port)
 	 * pointers.  The final argument is the output buffer size: we
 	 * can do any size, so we put PAGE_SIZE here.
 	 */
-	port->cons.vtermno = pdrvdata.next_vtermno;
+	spin_lock_irq(&pdrvdata_lock);
+	saved_vtermno = port->cons.vtermno;
+	port->cons.vtermno = pdrvdata.next_vtermno++;
+	spin_unlock_irq(&pdrvdata_lock);
 
+	/*
+	 * Can't hold the pdrvdata_lock across hvc_alloc.
+	 */
 	port->cons.hvc = hvc_alloc(port->cons.vtermno, 0, &hv_ops, PAGE_SIZE);
 	if (IS_ERR(port->cons.hvc)) {
 		ret = PTR_ERR(port->cons.hvc);
 		dev_err(port->dev,
 			"error %d allocating hvc for port\n", ret);
 		port->cons.hvc = NULL;
+		/*
+		 * This leaks a vtermno, but it probably doesn't matter.
+		 */
+		port->cons.vtermno = saved_vtermno;
 		return ret;
 	}
 	spin_lock_irq(&pdrvdata_lock);
-	pdrvdata.next_vtermno++;
 	list_add_tail(&port->cons.list, &pdrvdata.consoles);
 	spin_unlock_irq(&pdrvdata_lock);
 	port->guest_connected = true;

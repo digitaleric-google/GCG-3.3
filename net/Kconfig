@@ -72,6 +72,14 @@ config INET
 
 	  Short answer: say Y.
 
+config SOCK_COPROC
+	bool
+	default n
+	help
+	  This option enables the use of in-kernel apis allowing sockets
+	  to be implemented by a "socket coprocessor".
+	  If you are unsure how to answer this question, answer N.
+
 if INET
 source "net/ipv4/Kconfig"
 source "net/ipv6/Kconfig"

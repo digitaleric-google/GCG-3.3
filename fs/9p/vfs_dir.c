@@ -143,7 +143,8 @@ static int v9fs_dir_readdir(struct file *filp, void *dirent, filldir_t filldir)
 	p9_debug(P9_DEBUG_VFS, "name %s\n", filp->f_path.dentry->d_name.name);
 	fid = filp->private_data;
 
-	buflen = fid->clnt->msize - P9_IOHDRSZ;
+	/* Client msize can be big. Limit buffer size of reply. */
+	buflen = min(65536u, fid->clnt->msize - P9_IOHDRSZ);
 
 	err = v9fs_alloc_rdir_buf(filp, buflen);
 	if (err)

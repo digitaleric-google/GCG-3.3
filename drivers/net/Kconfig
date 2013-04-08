@@ -342,6 +342,22 @@ config VMXNET3
 	  To compile this driver as a module, choose M here: the
 	  module will be called vmxnet3.
 
+config VIRTIO_SOCKET
+	tristate "Virtio socket driver (EXPERIMENTAL)"
+	depends on EXPERIMENTAL
+	select SOCK_COPROC
+	select VIRTIO
+	select VIRTIO_RING
+	---help---
+	 This driver provides the ability for communicating with
+	 a paravirtualized socket device.  The socket device itself
+	 handles networking at the socket level (instead of at layer 2).
+	 Addressing internally uses URIs, but this functionality is
+	 transparent to userland.  Support for this device currently
+	 requires a virtual machine that implements the device.
+
+	 If unsure, say M.
+
 source "drivers/net/hyperv/Kconfig"
 
 endif # NETDEVICES

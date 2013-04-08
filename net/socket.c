@@ -104,6 +104,7 @@
 #include <linux/route.h>
 #include <linux/sockios.h>
 #include <linux/atalk.h>
+#include <linux/socket_coproc.h>
 
 static int sock_no_open(struct inode *irrelevant, struct file *dontcare);
 static ssize_t sock_aio_read(struct kiocb *iocb, const struct iovec *iov,
@@ -513,7 +514,9 @@ void sock_release(struct socket *sock)
 {
 	if (sock->ops) {
 		struct module *owner = sock->ops->owner;
+		int ret;
 
+		ret = socket_coproc_release(sock);
 		sock->ops->release(sock);
 		sock->ops = NULL;
 		module_put(owner);
@@ -548,6 +551,7 @@ static inline int __sock_sendmsg_nosec(struct kiocb *iocb, struct socket *sock,
 				       struct msghdr *msg, size_t size)
 {
 	struct sock_iocb *si = kiocb_to_siocb(iocb);
+	int err;
 
 	sock_update_classid(sock->sk);
 
@@ -558,7 +562,10 @@ static inline int __sock_sendmsg_nosec(struct kiocb *iocb, struct socket *sock,
 	si->msg = msg;
 	si->size = size;
 
-	return sock->ops->sendmsg(iocb, sock, msg, size);
+	err = socket_coproc_sendmsg(iocb, sock, msg, size);
+	if (err == -ENOTSOCK)
+		return sock->ops->sendmsg(iocb, sock, msg, size);
+	return err;
 }
 
 static inline int __sock_sendmsg(struct kiocb *iocb, struct socket *sock,
@@ -714,6 +721,7 @@ static inline int __sock_recvmsg_nosec(struct kiocb *iocb, struct socket *sock,
 				       struct msghdr *msg, size_t size, int flags)
 {
 	struct sock_iocb *si = kiocb_to_siocb(iocb);
+	int err;
 
 	sock_update_classid(sock->sk);
 
@@ -723,7 +731,10 @@ static inline int __sock_recvmsg_nosec(struct kiocb *iocb, struct socket *sock,
 	si->size = size;
 	si->flags = flags;
 
-	return sock->ops->recvmsg(iocb, sock, msg, size, flags);
+	err = socket_coproc_recvmsg(iocb, sock, msg, size, flags);
+	if (err == -ENOTSOCK)
+		return sock->ops->recvmsg(iocb, sock, msg, size, flags);
+	return err;
 }
 
 static inline int __sock_recvmsg(struct kiocb *iocb, struct socket *sock,
@@ -823,13 +834,17 @@ static ssize_t sock_splice_read(struct file *file, loff_t *ppos,
 				unsigned int flags)
 {
 	struct socket *sock = file->private_data;
+	ssize_t rlen;
 
 	if (unlikely(!sock->ops->splice_read))
 		return -EINVAL;
 
 	sock_update_classid(sock->sk);
 
-	return sock->ops->splice_read(sock, ppos, pipe, len, flags);
+	rlen = socket_coproc_splice_read(sock, ppos, pipe, len, flags);
+	if (rlen == -ENOTSOCK)
+		return sock->ops->splice_read(sock, ppos, pipe, len, flags);
+	return rlen;
 }
 
 static struct sock_iocb *alloc_sock_iocb(struct kiocb *iocb,
@@ -970,7 +985,9 @@ static long sock_do_ioctl(struct net *net, struct socket *sock,
 	int err;
 	void __user *argp = (void __user *)arg;
 
-	err = sock->ops->ioctl(sock, cmd, arg);
+	err = socket_coproc_ioctl(sock, cmd, arg);
+	if (err == -ENOTSOCK)
+		err = sock->ops->ioctl(sock, cmd, arg);
 
 	/*
 	 * If this ioctl is unknown try to hand it down
@@ -1095,19 +1112,28 @@ EXPORT_SYMBOL(sock_create_lite);
 static unsigned int sock_poll(struct file *file, poll_table *wait)
 {
 	struct socket *sock;
+	unsigned int mask;
+	int ret;
 
 	/*
 	 *      We can't return errors to poll, so it's either yes or no.
 	 */
 	sock = file->private_data;
+	ret = socket_coproc_poll(file, sock, wait, &mask);
+	if (ret != -ENOTSOCK)
+		return mask;
 	return sock->ops->poll(file, sock, wait);
 }
 
 static int sock_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct socket *sock = file->private_data;
+	int err;
 
-	return sock->ops->mmap(file, sock, vma);
+	err = socket_coproc_mmap(file, sock, vma);
+	if (err == -ENOTSOCK)
+		return sock->ops->mmap(file, sock, vma);
+	return err;
 }
 
 static int sock_close(struct inode *inode, struct file *filp)
@@ -1242,6 +1268,17 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 
 	sock->type = type;
 
+	/*
+	 * Give the socket-coprocessor first crack.
+	 */
+	err = socket_coproc_create(net, sock, protocol, kern);
+	if (err != -ENOTSOCK) {
+		/* Successfully handed off to co-processor. */
+		if (err < 0)
+			goto out_module_put;
+		goto skip_protocol_load;
+	}
+
 #ifdef CONFIG_MODULES
 	/* Attempt to load a protocol module if the find failed.
 	 *
@@ -1285,6 +1322,8 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 	 * module can have its refcnt decremented
 	 */
 	module_put(pf->owner);
+
+skip_protocol_load:
 	err = security_socket_post_create(sock, family, type, protocol, kern);
 	if (err)
 		goto out_sock_release;
@@ -1450,15 +1489,26 @@ SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (sock) {
 		err = move_addr_to_kernel(umyaddr, addrlen, (struct sockaddr *)&address);
-		if (err >= 0) {
-			err = security_socket_bind(sock,
-						   (struct sockaddr *)&address,
-						   addrlen);
-			if (!err)
-				err = sock->ops->bind(sock,
-						      (struct sockaddr *)
-						      &address, addrlen);
-		}
+		if (err < 0)
+			goto out_fput;
+
+		err = security_socket_bind(sock,
+					   (struct sockaddr *)&address,
+					   addrlen);
+		if (err)
+			goto out_fput;
+
+		err = socket_coproc_bind(sock,
+					 (struct sockaddr *) &address,
+					 addrlen);
+                /* Don't let Bind return EINTR to user. */
+                if (err == -EINTR)
+                        err = -ERESTARTNOINTR;
+		if (err == -ENOTSOCK)
+			err = sock->ops->bind(sock,
+					      (struct sockaddr *) &address,
+					      addrlen);
+out_fput:
 		fput_light(sock->file, fput_needed);
 	}
 	return err;
@@ -1483,8 +1533,11 @@ SYSCALL_DEFINE2(listen, int, fd, int, backlog)
 			backlog = somaxconn;
 
 		err = security_socket_listen(sock, backlog);
-		if (!err)
-			err = sock->ops->listen(sock, backlog);
+		if (!err) {
+			err = socket_coproc_listen(sock, backlog);
+			if (err == -ENOTSOCK)
+				err = sock->ops->listen(sock, backlog);
+		}
 
 		fput_light(sock->file, fput_needed);
 	}
@@ -1546,13 +1599,22 @@ SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
 	if (err)
 		goto out_fd;
 
-	err = sock->ops->accept(sock, newsock, sock->file->f_flags);
+	err = socket_coproc_accept(sock, newsock, sock->file->f_flags);
+	if (err == -ENOTSOCK)
+		err = sock->ops->accept(sock, newsock, sock->file->f_flags);
 	if (err < 0)
 		goto out_fd;
 
 	if (upeer_sockaddr) {
-		if (newsock->ops->getname(newsock, (struct sockaddr *)&address,
-					  &len, 2) < 0) {
+		err = socket_coproc_getname(newsock,
+					    (struct sockaddr *)&address,
+					    &len, 2);
+		if (err == -ENOTSOCK) {
+			err = newsock->ops->getname(newsock,
+						    (struct sockaddr *)&address,
+						    &len, 2);
+		}
+		if (err < 0) {
 			err = -ECONNABORTED;
 			goto out_fd;
 		}
@@ -1614,8 +1676,14 @@ SYSCALL_DEFINE3(connect, int, fd, struct sockaddr __user *, uservaddr,
 	if (err)
 		goto out_put;
 
-	err = sock->ops->connect(sock, (struct sockaddr *)&address, addrlen,
-				 sock->file->f_flags);
+	err = socket_coproc_connect(sock,
+				    (struct sockaddr *)&address,
+				    addrlen,
+				    sock->file->f_flags);
+	if (err == -ENOTSOCK)
+		err = sock->ops->connect(sock, (struct sockaddr *)&address,
+					 addrlen,
+					 sock->file->f_flags);
 out_put:
 	fput_light(sock->file, fput_needed);
 out:
@@ -1632,6 +1700,7 @@ SYSCALL_DEFINE3(getsockname, int, fd, struct sockaddr __user *, usockaddr,
 {
 	struct socket *sock;
 	struct sockaddr_storage address;
+	struct sockaddr *sockaddr = (struct sockaddr *)&address;
 	int len, err, fput_needed;
 
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
@@ -1642,10 +1711,12 @@ SYSCALL_DEFINE3(getsockname, int, fd, struct sockaddr __user *, usockaddr,
 	if (err)
 		goto out_put;
 
-	err = sock->ops->getname(sock, (struct sockaddr *)&address, &len, 0);
+	err = socket_coproc_getname(sock, sockaddr, &len, 0);
+	if (err == -ENOTSOCK)
+		err = sock->ops->getname(sock, sockaddr, &len, 0);
 	if (err)
 		goto out_put;
-	err = move_addr_to_user((struct sockaddr *)&address, len, usockaddr, usockaddr_len);
+	err = move_addr_to_user(sockaddr, len, usockaddr, usockaddr_len);
 
 out_put:
 	fput_light(sock->file, fput_needed);
@@ -1663,6 +1734,7 @@ SYSCALL_DEFINE3(getpeername, int, fd, struct sockaddr __user *, usockaddr,
 {
 	struct socket *sock;
 	struct sockaddr_storage address;
+	struct sockaddr *sockaddr = (struct sockaddr *)&address;
 	int len, err, fput_needed;
 
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
@@ -1673,11 +1745,11 @@ SYSCALL_DEFINE3(getpeername, int, fd, struct sockaddr __user *, usockaddr,
 			return err;
 		}
 
-		err =
-		    sock->ops->getname(sock, (struct sockaddr *)&address, &len,
-				       1);
+		err = socket_coproc_getname(sock, sockaddr, &len, 1);
+		if (err == -ENOTSOCK)
+			err = sock->ops->getname(sock, sockaddr, &len, 1);
 		if (!err)
-			err = move_addr_to_user((struct sockaddr *)&address, len, usockaddr,
+			err = move_addr_to_user(sockaddr, len, usockaddr,
 						usockaddr_len);
 		fput_light(sock->file, fput_needed);
 	}
@@ -1820,14 +1892,20 @@ SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
 		if (err)
 			goto out_put;
 
+
 		if (level == SOL_SOCKET)
 			err =
 			    sock_setsockopt(sock, level, optname, optval,
 					    optlen);
-		else
+		else {
+			err = socket_coproc_setsockopt(sock, level, optname,
+						       optval, optlen);
+			if (err != -ENOTSOCK)
+				goto out_put;
 			err =
 			    sock->ops->setsockopt(sock, level, optname, optval,
 						  optlen);
+		}
 out_put:
 		fput_light(sock->file, fput_needed);
 	}
@@ -1855,10 +1933,17 @@ SYSCALL_DEFINE5(getsockopt, int, fd, int, level, int, optname,
 			err =
 			    sock_getsockopt(sock, level, optname, optval,
 					    optlen);
-		else
-			err =
-			    sock->ops->getsockopt(sock, level, optname, optval,
-						  optlen);
+		else {
+			err = socket_coproc_getsockopt(sock,
+						       level,
+						       optname,
+						       optval,
+						       optlen);
+			if (err == -ENOTSOCK)
+				err =
+				    sock->ops->getsockopt(sock, level, optname,
+							  optval, optlen);
+		}
 out_put:
 		fput_light(sock->file, fput_needed);
 	}
@@ -1877,8 +1962,11 @@ SYSCALL_DEFINE2(shutdown, int, fd, int, how)
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (sock != NULL) {
 		err = security_socket_shutdown(sock, how);
-		if (!err)
-			err = sock->ops->shutdown(sock, how);
+		if (!err) {
+			err = socket_coproc_shutdown(sock, how);
+			if (err == -ENOTSOCK)
+				err = sock->ops->shutdown(sock, how);
+		}
 		fput_light(sock->file, fput_needed);
 	}
 	return err;
@@ -2543,6 +2631,8 @@ static int __init sock_init(void)
 	 *      Initialize skbuff SLAB cache
 	 */
 	skb_init();
+
+	socket_coproc_init();
 
 	/*
 	 *      Initialize the protocols module.

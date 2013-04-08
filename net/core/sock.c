@@ -645,8 +645,16 @@ set_rcvbuf:
 
 	case SO_KEEPALIVE:
 #ifdef CONFIG_INET
-		if (sk->sk_protocol == IPPROTO_TCP)
-			tcp_set_keepalive(sk, valbool);
+		if (sk->sk_protocol == IPPROTO_TCP) {
+			/*
+			 * This callout to TCP here is undesirable when
+			 * the socket is hijacked by virtiosocket.
+			 * TODO(mikew): Replace this with some other means of
+			 * avoiding a call into tcp.
+			 */
+			if (!test_bit(SOCK_HWASSIST, &sock->flags))
+				tcp_set_keepalive(sk, valbool);
+		}
 #endif
 		sock_valbool_flag(sk, SOCK_KEEPOPEN, valbool);
 		break;

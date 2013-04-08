@@ -11,12 +11,12 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
- * 
+ *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
@@ -78,6 +78,12 @@ static int sysrq_pressed;
 
 /* dynamic list of hvc_struct instances */
 static LIST_HEAD(hvc_structs);
+
+/*
+ * only one task does allocation at a time.
+ */
+static DEFINE_MUTEX(hvc_init_mutex);
+
 
 /*
  * Protect the list of hvc_struct instances from inserts and removals during
@@ -242,6 +248,7 @@ static void destroy_hvc_struct(struct kref *kref)
 
 	spin_unlock(&hvc_structs_lock);
 
+	kfree(hp->hvc_console);
 	kfree(hp);
 }
 
@@ -822,14 +829,19 @@ struct hvc_struct *hvc_alloc(uint32_t vtermno, int data,
 			     int outbuf_size)
 {
 	struct hvc_struct *hp;
+	struct console *cp;
 	int i;
 
 	/* We wait until a driver actually comes along */
+	mutex_lock(&hvc_init_mutex);
 	if (!hvc_driver) {
 		int err = hvc_init();
-		if (err)
+		if (err) {
+			mutex_unlock(&hvc_init_mutex);
 			return ERR_PTR(err);
+		}
 	}
+	mutex_unlock(&hvc_init_mutex);
 
 	hp = kzalloc(ALIGN(sizeof(*hp), sizeof(long)) + outbuf_size,
 			GFP_KERNEL);
@@ -845,6 +857,17 @@ struct hvc_struct *hvc_alloc(uint32_t vtermno, int data,
 	kref_init(&hp->kref);
 
 	INIT_WORK(&hp->tty_resize, hvc_set_winsz);
+	/*
+	 * Make each console its own struct console.
+	 */
+	cp = kmemdup(&hvc_console, sizeof(*cp), GFP_KERNEL);
+	if (!cp) {
+		kfree(hp);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	hp->hvc_console = cp;
+
 	spin_lock_init(&hp->lock);
 	spin_lock(&hvc_structs_lock);
 
@@ -863,8 +886,13 @@ struct hvc_struct *hvc_alloc(uint32_t vtermno, int data,
 
 	hp->index = i;
 
+	cp->index = i;
+	vtermnos[i] = vtermno;
+	cons_ops[i] = ops;
+
 	list_add_tail(&(hp->next), &hvc_structs);
 	spin_unlock(&hvc_structs_lock);
+	register_console(cp);
 
 	return hp;
 }
@@ -875,6 +903,8 @@ int hvc_remove(struct hvc_struct *hp)
 	unsigned long flags;
 	struct tty_struct *tty;
 
+	BUG_ON(!hp->hvc_console);
+	unregister_console(hp->hvc_console);
 	spin_lock_irqsave(&hp->lock, flags);
 	tty = tty_kref_get(hp->tty);
 

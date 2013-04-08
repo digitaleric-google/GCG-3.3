@@ -34,6 +34,8 @@
 #define VIRTIO_ID_CONSOLE	3 /* virtio console */
 #define VIRTIO_ID_RNG		4 /* virtio ring */
 #define VIRTIO_ID_BALLOON	5 /* virtio balloon */
+#define VIRTIO_ID_SCSI		8 /* virtio scsi */
 #define VIRTIO_ID_9P		9 /* 9p virtio console */
+#define VIRTIO_ID_SOCKET	10 /* virtio socket */
 
 #endif /* _LINUX_VIRTIO_IDS_H */
