@@ -695,17 +695,6 @@ static void native_machine_restart(char *__unused)
 	__machine_emergency_restart(0);
 }
 
-static void native_machine_halt(void)
-{
-	/* stop other cpus and apics */
-	machine_shutdown();
-
-	tboot_shutdown(TB_SHUTDOWN_HALT);
-
-	/* stop this cpu */
-	stop_this_cpu(NULL);
-}
-
 static void native_machine_power_off(void)
 {
 	if (pm_power_off) {
@@ -722,7 +711,8 @@ struct machine_ops machine_ops = {
 	.shutdown = native_machine_shutdown,
 	.emergency_restart = native_machine_emergency_restart,
 	.restart = native_machine_restart,
-	.halt = native_machine_halt,
+	/* Cause machine halts to shut down the system; see Google b/7993037 */
+	.halt = native_machine_power_off,
 #ifdef CONFIG_KEXEC
 	.crash_shutdown = native_machine_crash_shutdown,
 #endif
