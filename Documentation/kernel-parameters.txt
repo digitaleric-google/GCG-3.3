@@ -771,13 +771,6 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
 			kexec loader will pass this option to capture kernel.
 			See Documentation/kdump/kdump.txt for details.
 
-	enable_modelock [x86]
-			If the kernel is compiled with modelock support,
-			the kernel will try to pin certain CPU functions
-			in place early in the boot process.  modelock
-			can be disabled on boot by specifying
-			'enable_modelock=0'.
-
 	enable_mtrr_cleanup [X86]
 			The kernel tries to adjust MTRR layout from continuous
 			to discrete, to make X server driver able to add WB

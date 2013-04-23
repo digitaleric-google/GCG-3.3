@@ -35,7 +35,6 @@
 #include <asm/mce.h>
 #include <asm/msr.h>
 #include <asm/pat.h>
-#include <asm/modelock.h>
 
 #ifdef CONFIG_X86_LOCAL_APIC
 #include <asm/uv/uv.h>
@@ -1265,8 +1264,6 @@ void __cpuinit cpu_init(void)
 
 	if (is_uv_system())
 		uv_cpu_init();
-
-	modelock_init();
 }
 
 #else
@@ -1317,7 +1314,5 @@ void __cpuinit cpu_init(void)
 
 	fpu_init();
 	xsave_init();
-
-	modelock_init();
 }
 #endif

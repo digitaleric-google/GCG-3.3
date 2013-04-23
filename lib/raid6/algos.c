@@ -33,7 +33,14 @@ EXPORT_SYMBOL(raid6_empty_zero_page);
 struct raid6_calls raid6_call;
 EXPORT_SYMBOL_GPL(raid6_call);
 
+#if defined(__x86_64__)
+#define ONLY_USE_SSE2X4
+#endif
+
 const struct raid6_calls * const raid6_algos[] = {
+#ifdef ONLY_USE_SSE2X4
+	&raid6_sse2x4,
+#else
 	&raid6_intx1,
 	&raid6_intx2,
 	&raid6_intx4,
@@ -61,11 +68,16 @@ const struct raid6_calls * const raid6_algos[] = {
 	&raid6_altivec4,
 	&raid6_altivec8,
 #endif
+#endif
 	NULL
 };
 
 #ifdef __KERNEL__
-#define RAID6_TIME_JIFFIES_LG2	4
+# ifdef ONLY_USE_SSE2X4
+#  define RAID6_TIME_JIFFIES_LG2        2
+# else
+#  define RAID6_TIME_JIFFIES_LG2	4
+# endif
 #else
 /* Need more time to be stable in userspace */
 #define RAID6_TIME_JIFFIES_LG2	9

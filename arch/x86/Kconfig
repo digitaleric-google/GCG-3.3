@@ -567,24 +567,6 @@ menuconfig PARAVIRT_GUEST
 
 	  If you say N, all options in this submenu will be skipped and disabled.
 
-config X86_MODELOCK
-	bool "x86 modelock"
-	---help---
-	  This option enables modelock support.  This allows the kernel to
-	  indicate to the host when it's done executing real-mode code,
-	  allowing the host to disable real-mode support.
-
-config X86_MODELOCK_TEST
-	bool "CPU modelock verification"
-	depends on X86 && X86_MODELOCK && PROC_FS
-	default y
-	---help---
-	  The CPU should normally be prevented from switching out of
-          protected mode.  This module enables a simple test of the
-          modelock by creating a file named /proc/modelock_test.  If
-	  the word REAL is written to this file, then an attempt is
-	  made to switch the CPU into Real Mode.
-
 if PARAVIRT_GUEST
 
 config PARAVIRT_TIME_ACCOUNTING

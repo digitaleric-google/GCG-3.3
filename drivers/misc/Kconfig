@@ -498,6 +498,18 @@ config MAX8997_MUIC
 	  Maxim MAX8997 PMIC.
 	  The MAX8997 MUIC is a USB port accessory detector and switch.
 
+config GOOGLE_METRICS
+	tristate "Google performance metrics recorder card driver"
+	depends on PCI
+	default n
+	help
+	  The performance metrics recorder card driver allows kernel and
+          userspace components to export performance metrics for external
+          recording.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called gmetrics..
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"
