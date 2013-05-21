@@ -1951,7 +1951,12 @@ ext4_ext_put_in_cache(struct inode *inode, ext4_lblk_t block,
 			__u32 len, ext4_fsblk_t start)
 {
 	struct ext4_ext_cache *cex;
-	BUG_ON(len == 0);
+	if (len == 0) {
+		ext4_error(inode->i_sb,
+			"trying to put zero-length ext in cache");
+		WARN_ON(1);
+		return;
+	}
 	spin_lock(&EXT4_I(inode)->i_block_reservation_lock);
 	trace_ext4_ext_put_in_cache(inode, block, len, start);
 	cex = &EXT4_I(inode)->i_cached_extent;
@@ -3222,11 +3227,13 @@ static int check_eofblocks_fl(handle_t *handle, struct inode *inode,
 	depth = ext_depth(inode);
 	eh = path[depth].p_hdr;
 
-	if (unlikely(!eh->eh_entries)) {
-		EXT4_ERROR_INODE(inode, "eh->eh_entries == 0 and "
-				 "EOFBLOCKS_FL set");
-		return -EIO;
-	}
+	/*
+	 * We're going to remove EOFBLOCKS_FL entirely in future so we
+	 * do not care for this case anymore. Simply remove the flag
+	 * if there are no extents.
+	 */
+	if (unlikely(!eh->eh_entries))
+		goto out;
 	last_ex = EXT_LAST_EXTENT(eh);
 	/*
 	 * We should clear the EOFBLOCKS_FL flag if we are writing the
@@ -3250,6 +3257,7 @@ static int check_eofblocks_fl(handle_t *handle, struct inode *inode,
 	for (i = depth-1; i >= 0; i--)
 		if (path[i].p_idx != EXT_LAST_INDEX(path[i].p_hdr))
 			return 0;
+out:
 	ext4_clear_inode_flag(inode, EXT4_INODE_EOFBLOCKS);
 	return ext4_mark_inode_dirty(handle, inode);
 }
